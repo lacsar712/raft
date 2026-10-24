@@ -68,6 +68,58 @@ type BatchingFSM interface {
 	FSM
 }
 
+// DependencyFSM is an optional extension of FSM that allows independent
+// committed log entries to be applied to the FSM concurrently.
+//
+// For each LogCommand entry that is about to be applied, Raft calls
+// ApplyDependency once and is given the highest committed log index that
+// the entry depends on. The entry is not handed to Apply until every entry
+// up to and including that index has finished applying. Returning 0 means
+// the entry has no predecessor dependency and may be applied immediately,
+// concurrently with any other in-flight Apply.
+//
+// ApplyDependency is always invoked from a single goroutine, in committed
+// index order, and before Apply is invoked for the entry. It must be
+// deterministic, fast and must not block. The returned index must be
+// smaller than the entry's own index; values that are too large are
+// clamped to index-1. Just like Apply, the dependency declaration must be
+// deterministic so that every cluster member makes the same scheduling
+// decision.
+//
+// The following entries are never parallelized, even when DependencyFSM
+// is implemented:
+//   - LogConfiguration entries (AddVoter, RemoveServer and other membership
+//     changes, including versioned configurations): they are applied with
+//     no other Apply in flight and force every later entry to wait for them.
+//   - LogBarrier entries (Barrier): they complete only once all preceding
+//     applies have finished, and later entries wait for them as well.
+//
+// When an Apply returns an error (a non-nil value implementing the error
+// interface), every later entry whose declared dependency prefix contains
+// the failed index is not applied and its future is completed with
+// ErrDependencyAborted; no index is silently dropped. Entries that do not
+// depend on the failed entry are applied regardless of the failure, and
+// the failed entry's own error is delivered through ApplyFuture.Response
+// as usual.
+//
+// Snapshot and Restore still see a quiescent FSM: Snapshot is not invoked
+// until all in-flight applies have finished, and no Apply runs while
+// Snapshot or Restore is in progress.
+//
+// If an FSM implements both DependencyFSM and BatchingFSM, the
+// dependency-aware scheduling takes precedence and ApplyBatch is not
+// invoked.
+type DependencyFSM interface {
+	FSM
+
+	// ApplyDependency returns the highest committed log index that the
+	// given LogCommand entry depends on. Apply for the entry is delayed
+	// until all entries with an index less than or equal to the returned
+	// index have finished applying. Returning 0 means the entry does not
+	// depend on any prior entry and may be applied concurrently.
+	ApplyDependency(*Log) uint64
+}
+
 // FSMSnapshot is returned by an FSM in response to a Snapshot
 // It must be safe to invoke FSMSnapshot methods with concurrent
 // calls to Apply.
@@ -84,6 +136,14 @@ type FSMSnapshot interface {
 // to the FSM. This is done async of other logs since we don't want
 // the FSM to block our internal operations.
 func (r *Raft) runFSM() {
+	// An FSM implementing the optional DependencyFSM interface opts in to
+	// dependency-aware, potentially parallel application of logs. When the
+	// interface is absent everything below behaves exactly as it always has.
+	if _, ok := r.fsm.(DependencyFSM); ok {
+		r.runFSMParallel()
+		return
+	}
+
 	var lastIndex, lastTerm uint64
 
 	batchingFSM, batchingEnabled := r.fsm.(BatchingFSM)
@@ -186,30 +246,16 @@ func (r *Raft) runFSM() {
 	}
 
 	restore := func(req *restoreFuture) {
-		// Open the snapshot
-		meta, source, err := r.snapshots.Open(req.ID)
-		if err != nil {
-			req.respond(fmt.Errorf("failed to open snapshot %v: %v", req.ID, err))
-			return
-		}
-		defer func() { _ = source.Close() }()
-
-		snapLogger := r.logger.With(
-			"id", req.ID,
-			"last-index", meta.Index,
-			"last-term", meta.Term,
-			"size-in-bytes", meta.Size,
-		)
-
 		// Attempt to restore
-		if err := fsmRestoreAndMeasure(snapLogger, r.fsm, source, meta.Size); err != nil {
-			req.respond(fmt.Errorf("failed to restore snapshot %v: %v", req.ID, err))
+		index, term, err := r.restoreFSM(req)
+		if err != nil {
+			req.respond(err)
 			return
 		}
 
 		// Update the last index and term
-		lastIndex = meta.Index
-		lastTerm = meta.Term
+		lastIndex = index
+		lastTerm = term
 		req.respond(nil)
 	}
 
@@ -261,6 +307,32 @@ func (r *Raft) runFSM() {
 			return
 		}
 	}
+}
+
+// restoreFSM opens the snapshot described by req and restores it into the
+// FSM. On success it returns the last index and term contained in the
+// snapshot. This must only be invoked from the FSM goroutine.
+func (r *Raft) restoreFSM(req *restoreFuture) (uint64, uint64, error) {
+	// Open the snapshot
+	meta, source, err := r.snapshots.Open(req.ID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to open snapshot %v: %v", req.ID, err)
+	}
+	defer func() { _ = source.Close() }()
+
+	snapLogger := r.logger.With(
+		"id", req.ID,
+		"last-index", meta.Index,
+		"last-term", meta.Term,
+		"size-in-bytes", meta.Size,
+	)
+
+	// Attempt to restore
+	if err := fsmRestoreAndMeasure(snapLogger, r.fsm, source, meta.Size); err != nil {
+		return 0, 0, fmt.Errorf("failed to restore snapshot %v: %v", req.ID, err)
+	}
+
+	return meta.Index, meta.Term, nil
 }
 
 // fsmRestoreAndMeasure wraps the Restore call on an FSM to consistently measure

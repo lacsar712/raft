@@ -77,6 +77,13 @@ var (
 	// ErrIncompatibleLogStore is returned when the log store does not support
 	// or implement some required methods.
 	ErrIncompatibleLogStore = errors.New("log store does not implement some required methods or malformed")
+
+	// ErrDependencyAborted is returned from an Apply future when the entry
+	// is never handed to FSM.Apply because another, still in-flight entry it
+	// declared a dependency on (via DependencyFSM) returned an error. The
+	// failed entry's own error is delivered through the Apply response as
+	// usual; entries independent of the failure are still applied.
+	ErrDependencyAborted = errors.New("apply aborted because a dependency failed")
 )
 
 // Raft implements a Raft node.
